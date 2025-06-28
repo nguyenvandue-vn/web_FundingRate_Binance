@@ -1,8 +1,5 @@
-import asyncio
-import aiohttp
-import pandas as pd
+import requests
 from flask import Flask, render_template, jsonify
-import requests # Giữ lại requests cho việc gửi Telegram đơn giản
 
 # ==================== CẤU HÌNH TELEGRAM ====================
 TELEGRAM_BOT_TOKEN = "7932733422:AAGoC0K-gDz-mwnW9r8x72feqLjB5qJRWe0"
@@ -28,66 +25,77 @@ def send_telegram_notification(symbol, rate_pct):
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message_text, 'parse_mode': 'MarkdownV2', 'reply_markup': keyboard}
     
     try:
-        # Dùng requests ở đây vẫn ổn vì nó chạy độc lập và không thường xuyên
         requests.post(url, json=payload, timeout=5)
         print(f"Đã gửi cảnh báo Telegram thành công cho {symbol}.")
     except Exception as e:
         print(f"Lỗi khi gửi tin nhắn Telegram cho {symbol}: {e}")
 
-async def get_funding_data_async():
-    """Hàm chính, giờ đây hoàn toàn bất đồng bộ để lấy dữ liệu."""
+def get_lowest_funding_rates_with_trend():
     global previous_rates, notified_symbols
-
     url = "https://fapi.binance.com/fapi/v1/premiumIndex"
     try:
-        # Sử dụng aiohttp để gọi API không làm block server
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
-                response.raise_for_status()
-                data = await response.json()
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        # data bây giờ là một list các dictionary
+        data = response.json()
+
+        # --- PHẦN TỐI ƯU HÓA: KHÔNG DÙNG PANDAS ---
+        
+        # 1. Chuyển đổi và lọc dữ liệu bằng Python thuần túy
+        processed_data = []
+        for item in data:
+            try:
+                # Chuyển đổi funding rate sang dạng số, bỏ qua nếu lỗi
+                rate = float(item.get('lastFundingRate', 'not_a_number'))
+                item['lastFundingRate'] = rate
+                processed_data.append(item)
+            except (ValueError, TypeError):
+                continue # Bỏ qua các mục có dữ liệu không hợp lệ
+
+        # 2. Kiểm tra ngưỡng và gửi thông báo
+        funding_rate_threshold = -0.005
+        for item in processed_data:
+            symbol = item['symbol']
+            current_rate = item['lastFundingRate']
+            if current_rate <= funding_rate_threshold and symbol not in notified_symbols:
+                send_telegram_notification(symbol, current_rate * 100)
+                notified_symbols.add(symbol)
+            elif current_rate > funding_rate_threshold and symbol in notified_symbols:
+                notified_symbols.remove(symbol)
+        
+        # 3. Thêm xu hướng và tính toán phần trăm
+        current_rates_dict = {item['symbol']: item['lastFundingRate'] for item in processed_data}
+        
+        for item in processed_data:
+            old_rate = previous_rates.get(item['symbol'])
+            if old_rate is None or old_rate == item['lastFundingRate']:
+                item['trend'] = 'stable'
+            else:
+                item['trend'] = 'up' if item['lastFundingRate'] > old_rate else 'down'
+            item['lastFundingRate_pct'] = item['lastFundingRate'] * 100
+
+        # 4. Sắp xếp và lấy top 20
+        # Dùng hàm sorted của Python với lambda function để sắp xếp list of dictionaries
+        sorted_data = sorted(processed_data, key=lambda x: x['lastFundingRate_pct'])
+        top_negative = sorted_data[:5]
+
+        # Cập nhật dữ liệu cũ để so sánh lần sau
+        previous_rates = current_rates_dict.copy()
+        
+        return top_negative
+
     except Exception as e:
-        print(f"Lỗi khi lấy dữ liệu từ API Binance: {e}")
+        print(f"!!! LỖI NGHIÊM TRỌNG TRONG get_lowest_funding_rates_with_trend: {e}")
+        import traceback
+        traceback.print_exc()
         return []
-
-    # Phần xử lý pandas vẫn giữ nguyên vì nó là xử lý CPU, không phải I/O
-    df = pd.DataFrame(data)
-    numeric_cols = ['lastFundingRate']
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df.dropna(subset=['lastFundingRate'], inplace=True)
-
-    funding_rate_threshold = -0.005
-    for index, row in df.iterrows():
-        symbol = row['symbol']
-        current_rate = row['lastFundingRate']
-        if current_rate <= funding_rate_threshold and symbol not in notified_symbols:
-            send_telegram_notification(symbol, current_rate * 100)
-            notified_symbols.add(symbol)
-        elif current_rate > funding_rate_threshold and symbol in notified_symbols:
-            notified_symbols.remove(symbol)
-
-    current_rates_dict = df.set_index('symbol')['lastFundingRate'].to_dict()
-    def determine_trend(row):
-        symbol, current_rate = row['symbol'], row['lastFundingRate']
-        old_rate = previous_rates.get(symbol)
-        if old_rate is None or old_rate == current_rate: return 'stable'
-        return 'up' if current_rate > old_rate else 'down'
-
-    df['trend'] = df.apply(determine_trend, axis=1)
-    df['lastFundingRate_pct'] = df['lastFundingRate'] * 100
-    top_negative = df.sort_values(by='lastFundingRate_pct', ascending=True).head(5)
-    previous_rates = current_rates_dict.copy()
-    
-    return top_negative.to_dict('records')
 
 @app.route('/')
 def home():
     return render_template('index.html')
 
-# API route giờ là một hàm async
 @app.route('/api/data')
-async def api_data():
-    funding_data = await get_funding_data_async()
+def api_data():
+    funding_data = get_lowest_funding_rates_with_trend()
     return jsonify(funding_data)
 
-# Bỏ khối if __name__ == '__main__' vì gunicorn/uvicorn sẽ xử lý việc chạy app
